@@ -119,6 +119,13 @@ struct lua_filter *lua_config_create(struct flb_filter_instance *ins,
         return NULL;
     }
 
+    /* Config: window */
+    tmp = flb_filter_get_property("window", ins);
+    if (!tmp) {
+      lf->window = 0;
+    } else
+      lf->window = atoi(tmp);
+
     lf->l2c_types_num = 0;
     tmp = flb_filter_get_property("type_int_key", ins);
     if (tmp) {

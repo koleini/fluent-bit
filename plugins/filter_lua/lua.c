@@ -135,10 +135,10 @@ static void try_to_convert_data_type(struct lua_filter *lf,
     struct mk_list  *head     = NULL;
     struct l2c_type *l2c      = NULL;
 
-    if ((lua_type(l, -2) == LUA_TSTRING) 
+    if ((lua_type(l, -2) == LUA_TSTRING)
         && lua_type(l, -1) == LUA_TNUMBER){
         tmp = lua_tolstring(l, -2, &len);
-        
+
         mk_list_foreach_safe(head, tmp_list, &lf->l2c_types) {
             l2c = mk_list_entry(head, struct l2c_type, _head);
             if (!strncmp(l2c->key, tmp, len)) {
@@ -250,6 +250,81 @@ static int is_valid_func(lua_State *lua, flb_sds_t func)
     return ret;
 }
 
+int get_window_info(struct lua_filter *ctx, char *key)
+{
+  int val;
+  lua_getglobal(ctx->lua->state, LUA_WINDOW_INFO);
+  lua_pushstring(ctx->lua->state, key);
+  lua_gettable(ctx->lua->state, -2);
+  val = (int)lua_tonumber(ctx->lua->state, -1);
+  lua_pop(ctx->lua->state, 2);
+  return val;
+}
+
+void set_window_info(struct lua_filter *ctx, char *key, int val)
+{
+  lua_getglobal(ctx->lua->state, LUA_WINDOW_INFO);
+  lua_pushstring(ctx->lua->state, key);
+  lua_pushnumber(ctx->lua->state, val);
+  lua_settable(ctx->lua->state, -3);
+  lua_pop(ctx->lua->state, 1);
+}
+
+void create_record(struct lua_filter *ctx, char* tag, double ts, msgpack_object *p)
+{
+  lua_newtable(ctx->lua->state);
+
+  lua_pushstring(ctx->lua->state, "tag");
+  lua_pushstring(ctx->lua->state, tag);
+  lua_settable(ctx->lua->state, -3);
+
+  lua_pushstring(ctx->lua->state, "ts");
+  lua_pushnumber(ctx->lua->state, ts);
+  lua_settable(ctx->lua->state, -3);
+
+  lua_pushstring(ctx->lua->state, "record");
+  lua_pushmsgpack(ctx->lua->state, p);
+  lua_settable(ctx->lua->state, -3);
+}
+
+void update_window(struct lua_filter *ctx, char* tag, double ts, msgpack_object *p)
+{
+  int head, tail;
+  head = get_window_info(ctx, LUA_WINDOW_HEAD);
+  tail = get_window_info(ctx, LUA_WINDOW_TAIL);
+
+  if(!head && !tail)
+  {
+    head = 1;
+    tail = 1;
+  }
+  else if(tail == ctx->window && ctx->window > 1)
+  {
+    head = 2;
+    tail = 1;
+  }
+  else if (head == ctx->window)
+  {
+    head = 1;
+    tail = ctx->window;
+  }
+  else if(head == tail + 1)
+  {
+    head++;
+    tail++;
+  }
+  else
+    tail++;
+
+  lua_getglobal(ctx->lua->state, LUA_WINDOW);
+  create_record(ctx, tag, ts, p);
+  lua_rawseti(ctx->lua->state, -2, tail);
+  lua_pop(ctx->lua->state, 1);
+
+  set_window_info(ctx, LUA_WINDOW_HEAD, head);
+  set_window_info(ctx, LUA_WINDOW_TAIL, tail);
+}
+
 static int cb_lua_init(struct flb_filter_instance *f_ins,
                        struct flb_config *config,
                        void *data)
@@ -287,6 +362,20 @@ static int cb_lua_init(struct flb_filter_instance *f_ins,
 
         lua_config_destroy(ctx);
         return -1;
+    }
+
+    /* Create window tables */
+    if (ctx->window)
+    {
+      lua_newtable(ctx->lua->state);
+      lua_setglobal(ctx->lua->state, LUA_WINDOW);
+
+      lua_newtable(ctx->lua->state);
+      lua_setglobal(ctx->lua->state, LUA_WINDOW_INFO);
+
+      set_window_info(ctx, LUA_WINDOW_HEAD, 0);
+      set_window_info(ctx, LUA_WINDOW_TAIL, 0);
+      set_window_info(ctx, LUA_WINDOW_SIZE, ctx->window);
     }
 
     /* Set context */
@@ -432,6 +521,22 @@ static int cb_lua_filter(void *data, size_t bytes,
 
         l_code = (int) lua_tointeger(ctx->lua->state, -1);
         lua_pop(ctx->lua->state, 1);
+
+        if (ctx->window)
+          update_window(ctx, tag, ts, p);
+
+        /* Validations */
+        if (l_code == 1) {
+            ret = is_valid_map(data_sbuf.data, data_sbuf.size);
+            if (ret == FLB_FALSE) {
+                flb_error("[filter_lua] invalid table returned at %s(), %s",
+                          ctx->call, ctx->script);
+                msgpack_sbuffer_destroy(&tmp_sbuf);
+                msgpack_sbuffer_destroy(&data_sbuf);
+                msgpack_unpacked_destroy(&result);
+                return FLB_FILTER_NOTOUCH;
+            }
+        }
 
         if (l_code == -1) { /* Skip record */
             msgpack_sbuffer_destroy(&data_sbuf);

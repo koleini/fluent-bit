@@ -31,6 +31,7 @@
 #include <fluent-bit/stream_processor/flb_sp_parser.h>
 #include <fluent-bit/stream_processor/flb_sp_func_time.h>
 #include <fluent-bit/stream_processor/flb_sp_func_record.h>
+#include <fluent-bit/stream_processor/flb_sp_window.h>
 
 #include <stdlib.h>
 #include <sys/types.h>
@@ -551,6 +552,8 @@ struct flb_sp *flb_sp_create(struct flb_config *config)
     sp->config = config;
     mk_list_init(&sp->tasks);
 
+    mk_list_init(&sp->window.records);
+
     /* Lookup configuration file if any */
     if (config->stream_processor_file) {
         ret = sp_config_file(config, sp, config->stream_processor_file);
@@ -989,19 +992,15 @@ static int sp_process_data_aggr(char *tag, int tag_len,
                                 struct flb_sp *sp)
 {
     int i;
-    int ok;
     int len;
     int ret;
     int map_entries;
     int map_size;
     int key_id;
-    int records = 0;
     struct aggr_num *nums;
-    size_t off = 0;
     char key_name[256];
     msgpack_object root;
     msgpack_object map;
-    msgpack_unpacked result;
     msgpack_sbuffer mp_sbuf;
     msgpack_packer  mp_pck;
     msgpack_object key;
@@ -1011,6 +1010,7 @@ static int sp_process_data_aggr(char *tag, int tag_len,
     struct flb_sp_cmd *cmd = task->cmd;
     struct flb_sp_cmd_key *ckey;
     struct flb_exp_val *condition;
+    struct flb_sp_record *last_rec;
 
     /* Number of expected output entries in the map */
     map_entries = mk_list_size(&cmd->keys);
@@ -1023,8 +1023,6 @@ static int sp_process_data_aggr(char *tag, int tag_len,
     }
 
     /* vars initialization */
-    ok = MSGPACK_UNPACK_SUCCESS;
-    msgpack_unpacked_init(&result);
     msgpack_sbuffer_init(&mp_sbuf);
     msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
 
@@ -1035,13 +1033,41 @@ static int sp_process_data_aggr(char *tag, int tag_len,
     flb_time_append_to_msgpack(&tm, &mp_pck, 0);
     msgpack_pack_map(&mp_pck, map_entries);
 
+
     /* Iterate incoming records */
-    while (msgpack_unpack_next(&result, buf_data, buf_size, &off) == ok) {
-        root = result.data;
-        records++;
+    if (task->window.type == FLB_SP_WINDOW_DEFAULT) {
+        /*
+         * we assume that the window is the chunk of data passed to the
+         * stream-processing function.
+         */
+        task->window.records = 0;
+        task->window.start_rec = NULL;
+        task->window.end_rec = NULL;
+    }
+
+    last_rec = mk_list_entry_last(&sp->window.records,
+                                  struct flb_sp_record, _head);
+
+    while (task->window.end_rec != last_rec) {
+        /*  sp->window.records.next is the first element of the list */
+        if (task->window.start_rec == NULL && task->window.end_rec == NULL) {
+            task->window.start_rec =
+                mk_list_entry_first(&sp->window.records, struct flb_sp_record,
+                                    _head);
+            task->window.end_rec = task->window.start_rec;
+        }
+        else {
+            task->window.end_rec =
+                mk_list_entry_next(&task->window.end_rec->_head,
+                                   struct flb_sp_record, _head,
+                                   &sp->window.records);
+        }
+
+        root = task->window.end_rec->record->data;
+        task->window.records++;
 
         /* get the map data and it size (number of items) */
-        map   = root.via.array.ptr[1];
+        map = root.via.array.ptr[1];
         map_size = map.via.map.size;
 
         /* Evaluate condition */
@@ -1135,7 +1161,6 @@ static int sp_process_data_aggr(char *tag, int tag_len,
             }
         }
     }
-    msgpack_unpacked_destroy(&result);
 
     /* Packaging results */
     ckey = mk_list_entry_first(&cmd->keys, struct flb_sp_cmd_key, _head);
@@ -1199,10 +1224,10 @@ static int sp_process_data_aggr(char *tag, int tag_len,
         case FLB_SP_AVG:
             /* average = sum(values) / records */
             if (nums[i].type == FLB_SP_NUM_I64) {
-                msgpack_pack_float(&mp_pck, nums[i].i64 / records);
+                msgpack_pack_float(&mp_pck, nums[i].i64 / task->window.records);
             }
             else if (nums[i].type == FLB_SP_NUM_F64) {
-                msgpack_pack_float(&mp_pck, nums[i].f64 / records);
+                msgpack_pack_float(&mp_pck, nums[i].f64 / task->window.records);
             }
             break;
         case FLB_SP_SUM:
@@ -1218,7 +1243,7 @@ static int sp_process_data_aggr(char *tag, int tag_len,
             break;
         case FLB_SP_COUNT:
             /* number of records in total */
-            msgpack_pack_int64(&mp_pck, records);
+            msgpack_pack_int64(&mp_pck, task->window.records);
             break;
         }
 
@@ -1231,7 +1256,7 @@ static int sp_process_data_aggr(char *tag, int tag_len,
     *out_buf = mp_sbuf.data;
     *out_size = mp_sbuf.size;
 
-    return records;
+    return task->window.records;
 }
 
 /*
@@ -1440,11 +1465,20 @@ int flb_sp_do(struct flb_sp *sp, struct flb_input_instance *in,
     struct mk_list *head;
     struct flb_sp_task *task;
     struct flb_sp_cmd *cmd;
+    bool update_window;
 
     /* Lookup Tasks that matches the incoming instance data */
     mk_list_foreach(head, &sp->tasks) {
         task = mk_list_entry(head, struct flb_sp_task, _head);
         cmd = task->cmd;
+
+        if (task->window.type == FLB_SP_WINDOW_DEFAULT) {
+            update_window = true;
+        }
+        else {
+            update_window = false;
+        }
+
         if (cmd->source_type == FLB_SP_STREAM) {
             if (task->source_instance == in) {
                 /*
@@ -1452,6 +1486,22 @@ int flb_sp_do(struct flb_sp *sp, struct flb_input_instance *in,
                  * processing.
                  */
                 if (task->aggr_keys == FLB_TRUE) {
+                    if (task->window.type == FLB_SP_WINDOW_DEFAULT &&
+                        update_window) {
+                        /*
+                         * update window only when the first aggr task is met.
+                         * The default assumes that buff_data is the window.
+                        */
+                        sp_clear_window(sp);
+                        ret = sp_populate_window(sp, buf_data, buf_size);
+                        if (ret == -1) {
+                            flb_error("[sp] error populating window for '%'",
+                                      task->name);
+                            continue;
+                        }
+                        update_window = false;
+                    }
+
                     ret = sp_process_data_aggr(tag, tag_len,
                                                buf_data, buf_size,
                                                &out_buf, &out_size,

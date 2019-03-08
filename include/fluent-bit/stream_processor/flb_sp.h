@@ -3,6 +3,7 @@
 /*  Fluent Bit
  *  ==========
  *  Copyright (C) 2019      The Fluent Bit Authors
+ *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +25,25 @@
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_time.h>
 #include <monkey/mk_core.h>
+
+struct flb_sp_record {
+    msgpack_unpacked *record;
+    struct flb_time tms;
+    struct mk_list _head;   /* link to parent list flb_sp_window->records */
+};
+
+struct flb_sp_window {
+    struct mk_list records;         /* records recieved from input */
+};
+
+struct flb_sp_task_window {
+    int type;                        /* type of the window */
+    struct flb_sp_record *start_rec; /* task window start record */
+    struct flb_sp_record *end_rec;   /* task window end record */
+    int records;                     /* number of records in the window */
+};
 
 struct flb_sp_task {
     flb_sds_t name;          /* task name      */
@@ -46,12 +65,15 @@ struct flb_sp_task {
     int aggr_keys;           /* do commands contains aggregated keys ? */
     struct flb_sp *sp;       /* parent context */
     struct flb_sp_cmd *cmd;  /* (SQL) commands */
-    struct mk_list _head;    /* link to parent list flb_sp->tasks */
+
+    struct flb_sp_task_window window; /* task window */
+    struct mk_list _head;             /* link to parent list flb_sp->tasks */
 };
 
 struct flb_sp {
-    struct mk_list tasks;       /* processor tasks */
-    struct flb_config *config;  /* reference to Fluent Bit context */
+    struct mk_list tasks;        /* processor tasks */
+    struct flb_sp_window window; /* aggregation window */
+    struct flb_config *config;   /* reference to Fluent Bit context */
 };
 
 struct flb_sp *flb_sp_create(struct flb_config *config);
